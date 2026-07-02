@@ -1,120 +1,80 @@
-"""
-src/pipeline/preprocess.py
-
-Pure Classical ML Pipeline - Preprocessing Module
-Author: Senior Machine Learning Systems Architect
-
-Strict Engineering Rules:
-- NO SCIKIT-LEARN or PANDAS imported or used.
-- Pure NumPy mathematical operations for data ingestion, normalization, and splits.
-- Pure NumPy serialization (save/load) for feature scaler statistics.
-"""
-
 import csv
 import os
-from typing import Dict, List, Tuple, Union
 import numpy as np
 
 
 class HandLandmarkPreprocessor:
-    """
-    Handles CSV ingestion, label encoding/decoding, spatial anchor normalization,
-    and Z-score feature scaling using pure NumPy.
-    """
+    """Handles CSV data loading and spatial standardization for hand coordinates."""
 
     def __init__(self):
-        # Mapping from categorical string labels ('A'-'Z') to integer IDs (0-25)
-        self.label_to_index: Dict[str, int] = {chr(65 + i): i for i in range(26)}
-        self.index_to_label: Dict[int, str] = {i: chr(65 + i) for i in range(26)}
-        
-        # Dataset-level statistics for feature standardization across training set
-        self.feature_mean: Union[np.ndarray, None] = None
-        self.feature_std: Union[np.ndarray, None] = None
+        self.label_to_index = {chr(65 + i): i for i in range(26)}
+        self.index_to_label = {i: chr(65 + i) for i in range(26)}
+        self.feature_mean = None
+        self.feature_std = None
 
-    def load_csv_dataset(self, filepath: str) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Loads the landmark CSV dataset into pure NumPy arrays without Pandas.
-        """
+    def load_csv_dataset(self, filepath: str):
+        """Reads 63-dimensional coordinate vectors and integer class labels from disk."""
         if not os.path.exists(filepath):
-            raise FileNotFoundError(f"Dataset not found at path: {filepath}")
+            raise FileNotFoundError(f"Dataset not found: {filepath}")
 
-        features_list: List[List[float]] = []
-        labels_list: List[int] = []
+        features, labels = [], []
 
-        with open(filepath, mode="r", encoding="utf-8") as file:
-            reader = csv.reader(file)
+        with open(filepath, mode="r", encoding="utf-8") as f:
+            reader = csv.reader(f)
             header = next(reader, None)
-            if header and not header[0].replace(".", "").replace("-", "").isdigit():
-                pass
-            else:
-                file.seek(0)
-                reader = csv.reader(file)
+            # Handle files that might not have a text header row
+            if header and header[0].replace(".", "").replace("-", "").isdigit():
+                f.seek(0)
+                reader = csv.reader(f)
 
             for row in reader:
                 if not row or len(row) < 64:
                     continue
                 try:
-                    coords = [float(val) for val in row[:63]]
-                    raw_label = row[63].strip().upper()
-                    if raw_label not in self.label_to_index:
-                        continue
-                    features_list.append(coords)
-                    labels_list.append(self.label_to_index[raw_label])
+                    coords = [float(x) for x in row[:63]]
+                    label = row[63].strip().upper()
+                    if label in self.label_to_index:
+                        features.append(coords)
+                        labels.append(self.label_to_index[label])
                 except ValueError:
                     continue
 
-        X = np.array(features_list, dtype=np.float64)
-        y = np.array(labels_list, dtype=np.int64)
-        return X, y
+        return np.array(features, dtype=np.float64), np.array(labels, dtype=np.int64)
 
     @staticmethod
     def normalize_sample_spatial(X: np.ndarray, anchor_mode: str = "wrist", eps: float = 1e-8) -> np.ndarray:
-        """
-        Performs per-frame spatial anchoring and sample-wise Z-score normalization.
-        """
+        """Translates joints relative to wrist anchor and normalizes scale."""
         is_1d = (X.ndim == 1)
-        if is_1d:
-            X_mat = X.reshape(1, -1)
-        else:
-            X_mat = X.copy()
-
-        N = X_mat.shape[0]
-        coords_3d = X_mat.reshape(N, 21, 3)
+        X_mat = X.reshape(1, -1) if is_1d else X.copy()
+        n_samples = X_mat.shape[0]
+        
+        coords = X_mat.reshape(n_samples, 21, 3)
 
         if anchor_mode == "wrist":
-            anchor = coords_3d[:, 0:1, :]
+            anchor = coords[:, 0:1, :]
         elif anchor_mode == "min_x":
-            min_x_indices = np.argmin(coords_3d[:, :, 0], axis=1)
-            anchor = coords_3d[np.arange(N), min_x_indices, :][:, np.newaxis, :]
+            idx = np.argmin(coords[:, :, 0], axis=1)
+            anchor = coords[np.arange(n_samples), idx, :][:, np.newaxis, :]
         else:
-            raise ValueError(f"Unsupported anchor_mode: {anchor_mode}")
+            raise ValueError(f"Invalid anchor mode: {anchor_mode}")
 
-        coords_centered = coords_3d - anchor
-        X_centered = coords_centered.reshape(N, 63)
+        centered = (coords - anchor).reshape(n_samples, 63)
+        mean = np.mean(centered, axis=1, keepdims=True)
+        std = np.std(centered, axis=1, keepdims=True)
 
-        sample_mean = np.mean(X_centered, axis=1, keepdims=True)
-        sample_std = np.std(X_centered, axis=1, keepdims=True)
-
-        X_norm = (X_centered - sample_mean) / (sample_std + eps)
-
-        if is_1d:
-            return X_norm.flatten()
-        return X_norm
+        normed = (centered - mean) / (std + eps)
+        return normed.flatten() if is_1d else normed
 
     def fit_transform_dataset_scaler(self, X: np.ndarray, eps: float = 1e-8) -> np.ndarray:
-        """
-        Fits dataset-level feature standardization and transforms the training set.
-        """
+        """Computes feature means/stds across dataset and standardizes inputs."""
         self.feature_mean = np.mean(X, axis=0, keepdims=True)
         self.feature_std = np.std(X, axis=0, keepdims=True)
         return (X - self.feature_mean) / (self.feature_std + eps)
 
     def transform_dataset_scaler(self, X: np.ndarray, eps: float = 1e-8) -> np.ndarray:
-        """
-        Transforms test or live inference features using fitted dataset statistics.
-        """
+        """Applies pre-computed feature standardization to new inference frames."""
         if self.feature_mean is None or self.feature_std is None:
-            raise RuntimeError("Dataset scaler statistics not fitted. Call fit_transform_dataset_scaler first.")
+            raise RuntimeError("Scaler not fitted yet.")
         
         is_1d = (X.ndim == 1)
         X_mat = X.reshape(1, -1) if is_1d else X
@@ -122,20 +82,16 @@ class HandLandmarkPreprocessor:
         return scaled.flatten() if is_1d else scaled
 
     def save(self, filepath: str) -> None:
-        """
-        Serializes fitted preprocessor scaler statistics to disk using pure NumPy savez_compressed.
-        """
-        if self.feature_mean is None or self.feature_std is None:
-            raise RuntimeError("Cannot save preprocessor: statistics have not been fitted.")
+        """Saves fitted scaler statistics to disk."""
+        if self.feature_mean is None:
+            raise RuntimeError("Cannot save unfitted preprocessor.")
         os.makedirs(os.path.dirname(os.path.abspath(filepath)), exist_ok=True)
         np.savez_compressed(filepath, feature_mean=self.feature_mean, feature_std=self.feature_std)
 
-    def load(self, filepath: str) -> "HandLandmarkPreprocessor":
-        """
-        Loads serialized preprocessor scaler statistics from disk into memory.
-        """
+    def load(self, filepath: str):
+        """Loads scaler statistics from disk."""
         if not os.path.exists(filepath):
-            raise FileNotFoundError(f"Serialized preprocessor file not found: {filepath}")
+            raise FileNotFoundError(f"Missing preprocessor file: {filepath}")
         data = np.load(filepath)
         self.feature_mean = data["feature_mean"]
         self.feature_std = data["feature_std"]
